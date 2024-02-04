@@ -1,5 +1,4 @@
 #include "pch.hpp"
-#include "tasky.hpp"
 
 #define LOG(...) std::println(__VA_ARGS__)
 #define DBG(...) // std::println(__VA_ARGS__)
@@ -43,6 +42,18 @@ public:
 class TaskBasePromise
 {
 public:
+	static void* operator new(std::size_t bytes)
+	{
+		LOG("alloc");
+		return malloc(bytes);
+	}
+
+	static void operator delete(void* ptr)
+	{
+		LOG("free");
+		free(ptr);
+	}
+
 	template<typename T>
 	static BaseHandle castHandle(std::coroutine_handle<T> handle)
 	{
@@ -54,7 +65,10 @@ public:
 		return BaseHandle::from_address(ptr).promise();
 	}
 
-	virtual ~TaskBasePromise() {}
+	virtual ~TaskBasePromise()
+	{
+		LOG("~TaskBasePromise");
+	}
 
 	std::suspend_always initial_suspend() noexcept
 	{
@@ -67,7 +81,6 @@ public:
 		DBG("final_suspend()");
 		return {};
 	}
-
 
 	void unhandled_exception()
 	{
@@ -170,7 +183,6 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char* argv[])
 	Scheduler s;
 
 	s.schedule(test(c));
-
 	s.run();
 
 	return 0;
@@ -190,13 +202,14 @@ void Scheduler::run()
 		else
 		{
 			task.resume();
-			if (!task.done())
+			if (task.done())
 			{
-				// DBG("Task awaited?");
-			}
-			else if (task.promise().awaitingHandle != nullptr)
-			{
-				schedule(task.promise().awaitingHandle.address());
+				if (task.promise().awaitingHandle != nullptr)
+				{
+					schedule(task.promise().awaitingHandle.address());
+				}
+
+				task.destroy();
 			}
 		}
 	}
