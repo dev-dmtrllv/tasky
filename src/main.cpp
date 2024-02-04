@@ -20,37 +20,37 @@ public:
 	template<typename T>
 	void schedule(Task<T>&& task)
 	{
-		DBG("schedule");
 		schedule(task.handle.address());
 	}
 
 	template<typename T, typename... Ts>
 	void schedule(Task<T>&& task, Ts&&... ts)
 	{
-		schedule(task);
+		schedule(std::move(task));
 		schedule(std::forward<Ts>(ts)...);
 	}
 
 	void run();
 
 	void schedule(void* taskPtr);
+	void scheduleAwaiting(void* taskPtr);
 
 	std::queue<void*> tasks;
+	std::atomic<std::size_t> tasksInFlight = 0;
 };
-
 
 class TaskBasePromise
 {
 public:
 	static void* operator new(std::size_t bytes)
 	{
-		LOG("alloc");
+		DBG("alloc");
 		return malloc(bytes);
 	}
 
 	static void operator delete(void* ptr)
 	{
-		LOG("free");
+		DBG("free");
 		free(ptr);
 	}
 
@@ -67,7 +67,9 @@ public:
 
 	virtual ~TaskBasePromise()
 	{
-		LOG("~TaskBasePromise");
+		DBG("~TaskBasePromise");
+		assert(scheduler);
+		scheduler->tasksInFlight.fetch_sub(1, std::memory_order::acq_rel);
 	}
 
 	std::suspend_always initial_suspend() noexcept
@@ -158,22 +160,56 @@ public:
 	}
 };
 
+
+template<>
+class Task<void> : public TaskBase
+{
+public:
+	class promise_type : public TaskBasePromise
+	{
+	public:
+		virtual ~promise_type() {}
+
+		Task<void> get_return_object()
+		{
+			DBG("get_return_object()");
+			return Task(std::coroutine_handle<promise_type>::from_promise(*this));
+		}
+
+		void return_void()
+		{
+			DBG("return_value()");
+			didReturn = true;
+		}
+
+		bool didReturn = false;
+	};
+
+	Task(std::coroutine_handle<promise_type> handle) : TaskBase(handle) {}
+	virtual ~Task() {}
+
+	void await_resume()
+	{
+		DBG("await_resume()");
+	}
+};
+
 Task<int> test2(int a, int b)
 {
 	LOG("test2({}, {}) -> {}", a, b, a + b);
 	co_return a + b;
 }
 
-Task<int> test(int count)
+Task<void> test(int count)
 {
 	int a = 0;
+
+	LOG("test({})", count);
 
 	for (int i = 0; i < count; i++)
 		a = co_await test2(a, i);
 
 	LOG("test result: {}", a);
-
-	co_return a;
 }
 
 int main([[maybe_unused]] int argc, [[maybe_unused]] char* argv[])
@@ -182,7 +218,8 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char* argv[])
 
 	Scheduler s;
 
-	s.schedule(test(c));
+	s.schedule(test(c), test(c));
+
 	s.run();
 
 	return 0;
@@ -190,8 +227,9 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char* argv[])
 
 void Scheduler::run()
 {
-	while (tasks.size() > 0)
+	while (tasksInFlight.load(std::memory_order::acquire) > 0)
 	{
+		DBG("-------- RUN NEXT --------");
 		auto task = BaseHandle::from_address(tasks.front());
 		tasks.pop();
 
@@ -205,11 +243,13 @@ void Scheduler::run()
 			if (task.done())
 			{
 				if (task.promise().awaitingHandle != nullptr)
-				{
-					schedule(task.promise().awaitingHandle.address());
-				}
+					scheduleAwaiting(task.promise().awaitingHandle.address());
 
 				task.destroy();
+			}
+			else
+			{
+				DBG("Awaiting...");
 			}
 		}
 	}
@@ -217,6 +257,15 @@ void Scheduler::run()
 
 void Scheduler::schedule(void* taskPtr)
 {
+	DBG("schedule");
+	tasksInFlight.fetch_add(1, std::memory_order::acq_rel);
+	BaseHandle::from_address(taskPtr).promise().scheduler = this;
+	tasks.push(taskPtr);
+}
+
+void Scheduler::scheduleAwaiting(void* taskPtr)
+{
+	DBG("schedule awaiting");
 	BaseHandle::from_address(taskPtr).promise().scheduler = this;
 	tasks.push(taskPtr);
 }
