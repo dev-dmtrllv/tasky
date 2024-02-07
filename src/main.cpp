@@ -3,34 +3,37 @@
 
 using namespace tasky;
 
-Task<int> add(int a, int b)
+Task<int> test2(int i)
 {
-	co_return a + b;
+	co_return i + 1;
 }
 
-Task<int> test_loop(int loops)
+Task<void> test3(int i)
 {
-	int x = 0;
-
-	for (int i = 0; i < loops; i++)
-		x += co_await add(x, i); // await till the add is done
-
-	co_return x;
+	std::cout << i << std::endl;
+	co_return;
 }
 
 Task<void> test(int loops = 1)
 {
 	// await till the loop is done
-	auto x = co_await test_loop(loops);
-	std::cout << x << std::endl;
+
+	auto y = co_await tasky::all({ test2(0), test2(1), test2(2) });
+
+	for (auto& x : y)
+		std::cout << x << std::endl;
+
+	co_await tasky::all({ test3(0), test3(1), test3(2) });
 }
 
 int main([[maybe_unused]] int argc, [[maybe_unused]] char* argv[])
 {
+	int loops = argc > 1 ? atoi(argv[1]) : 1;
+
 	Scheduler s;
-	
+
 	// schedule the test coroutine to run
-	s.schedule(test(1000));
+	s.schedule(test(loops));
 
 	// run all schedules tasks/coroutines
 	s.run();
