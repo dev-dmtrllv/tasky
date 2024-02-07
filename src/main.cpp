@@ -10,14 +10,17 @@ Task<int> test2(int i)
 
 Task<void> test3(int i)
 {
+	if (i == 0)
+		throw std::runtime_error("i == 0");
+
 	std::cout << i << std::endl;
+
 	co_return;
 }
 
 Task<void> test(int loops = 1)
 {
 	// await till the loop is done
-
 	auto y = co_await tasky::all({ test2(0), test2(1), test2(2) });
 
 	for (auto& x : y)
@@ -35,8 +38,15 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char* argv[])
 	// schedule the test coroutine to run
 	s.schedule(test(loops));
 
-	// run all schedules tasks/coroutines
-	s.run();
+	try
+	{
+		// run all schedules tasks/coroutines
+		s.run();
+	}
+	catch (const std::runtime_error& e)
+	{
+		std::cout << e.what() << std::endl;
+	}
 
 	return 0;
 }

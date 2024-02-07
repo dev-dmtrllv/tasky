@@ -42,9 +42,6 @@ namespace tasky
 		Scheduler* scheduler = nullptr;
 	};
 
-
-
-
 	class Scheduler
 	{
 	public:
@@ -188,8 +185,19 @@ namespace tasky
 
 			constexpr Task<T> get_return_object() noexcept { return Task<T>(std::coroutine_handle<promise_type>::from_promise(*this)); }
 
-			constexpr void return_value(const T& val) noexcept { value.emplace(std::move(val)); }
-			constexpr void return_value(T&& val) noexcept { value.emplace(val); }
+			constexpr void return_value(const T& val) noexcept
+			{
+				if (exception)
+					std::rethrow_exception(exception);
+				value.emplace(std::move(val));
+			}
+
+			constexpr void return_value(T&& val)
+			{
+				if (exception)
+					std::rethrow_exception(exception);
+				value.emplace(val);
+			}
 
 			std::optional<T> value;
 		};
@@ -207,8 +215,11 @@ namespace tasky
 			{
 				constexpr bool await_ready() const noexcept { return false; }
 
-				constexpr T await_resume() const noexcept
+				constexpr T await_resume() const
 				{
+					if (coro.promise().exception)
+						std::rethrow_exception(coro.promise().exception);
+
 					return std::move(coro.promise().value.value());
 				}
 
@@ -254,7 +265,11 @@ namespace tasky
 
 			Task<void> get_return_object() noexcept { return Task<void>(std::coroutine_handle<promise_type>::from_promise(*this)); }
 
-			constexpr void return_void() const noexcept {}
+			constexpr void return_void() const
+			{
+				if (exception)
+					std::rethrow_exception(exception);
+			}
 		};
 
 		using Handle = std::coroutine_handle<promise_type>;
@@ -269,7 +284,12 @@ namespace tasky
 			struct Awaiter
 			{
 				constexpr bool await_ready() const noexcept { return false; }
-				constexpr void await_resume() const noexcept {}
+
+				constexpr void await_resume() const
+				{
+					if (coro.promise().exception)
+						std::rethrow_exception(coro.promise().exception);
+				}
 
 				void await_suspend(std::coroutine_handle<> awaiting_handle)
 				{
@@ -300,7 +320,7 @@ namespace tasky
 		{
 			constexpr bool await_ready() const noexcept { return false; }
 
-			constexpr std::vector<T> await_resume() const noexcept
+			constexpr std::vector<T> await_resume() const
 			{
 				std::vector<T> results;
 				for (auto& coro : coros)
@@ -308,6 +328,10 @@ namespace tasky
 					using P = Task<T, Allocator>::promise_type;
 					auto x = std::coroutine_handle<P>::from_address(coro.address());
 					auto& p = x.promise();
+
+					if (p.exception)
+						std::rethrow_exception(p.exception);
+
 					results.emplace_back(p.value.value());
 				}
 				return results;
@@ -353,7 +377,16 @@ namespace tasky
 		{
 			constexpr bool await_ready() const noexcept { return false; }
 
-			constexpr void await_resume() const noexcept {}
+			constexpr void await_resume() const
+			{
+				for (auto& coro : coros)
+				{
+					auto& promise = PromiseBase::cast(coro).promise();
+
+					if (promise.exception)
+						std::rethrow_exception(promise.exception);
+				}
+			}
 
 			void await_suspend(std::coroutine_handle<> awaiting_handle)
 			{

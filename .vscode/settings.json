@@ -73,6 +73,11 @@
 		"chrono": "cpp",
 		"forward_list": "cpp",
 		"iomanip": "cpp",
-		"sstream": "cpp"
+		"sstream": "cpp",
+		"cassert": "cpp",
+		"cerrno": "cpp",
+		"cfloat": "cpp",
+		"climits": "cpp",
+		"string_view": "cpp"
 	}
 }
