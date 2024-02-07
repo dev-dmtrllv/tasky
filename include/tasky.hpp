@@ -26,7 +26,7 @@ namespace tasky
 			exception = std::current_exception();
 		}
 
-		virtual ~PromiseBase() = 0 {}
+		virtual ~PromiseBase() {}
 
 		std::coroutine_handle<PromiseBase> awaiting_coro;
 		std::exception_ptr exception = nullptr;
@@ -44,6 +44,18 @@ namespace tasky
 			queue_(1024)
 		{
 
+		}
+
+		template<typename T>
+		void schedule(std::vector<Task<T>> tasks)
+		{
+			running_tasks.fetch_add(tasks.size(), std::memory_order::acq_rel);
+			for (auto& t : tasks)
+			{
+				std::coroutine_handle<PromiseBase> h = PromiseBase::cast(t.handle);
+				h.promise().scheduler = this;
+				queue_.push(h);
+			}
 		}
 
 		template<typename T>
@@ -89,8 +101,6 @@ namespace tasky
 		{
 			while (running_tasks.load(std::memory_order::acquire) > 1)
 				run_next_task();
-
-			std::cout << "thread done..." << std::endl;
 		}
 
 		void run_next_task()
@@ -122,7 +132,7 @@ namespace tasky
 		{
 			if (queue_.size() == 0)
 				return nullptr;
-			
+
 			std::coroutine_handle<PromiseBase> handle = nullptr;
 			queue_.try_pop(handle);
 			return handle;
@@ -188,10 +198,6 @@ namespace tasky
 
 		Handle handle;
 	};
-
-
-
-
 
 	template<>
 	class Task<void>

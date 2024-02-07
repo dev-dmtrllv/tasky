@@ -11,7 +11,7 @@ file(GLOB_RECURSE HEADERS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/include
 
 add_executable(tasky ${SOURCES} ${HEADERS})
 
-if (MSVC)
+if(MSVC)
 	add_definitions(
 		-DNOMINMAX
 		-DUNICODE
@@ -23,18 +23,12 @@ if (MSVC)
 		/WX
 		/analyze
 		/wd4324
+		/O2
 	)
 else()
 	target_compile_options(tasky PUBLIC -Wall -Wextra -pedantic -Werror -Wno-unused-variable -O3 -fsanitize=undefined)
 	target_link_options(tasky PUBLIC -fsanitize=undefined)
-	# if(${CMAKE_BUILD_TYPE} matches Debug)
-		# set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=undefined")
-		# set(CMAKE_C_FLAGS_INIT "-fsanitize=undefined")
-		# set(CMAKE_CXX_FLAGS_INIT "-fsanitize=undefined")
-		# add_compile_options(-fno-omit-frame-pointer)
-	# endif()
 endif()
-
 
 target_include_directories(tasky PUBLIC include)
 target_precompile_headers(tasky PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include/pch.hpp")

@@ -1,0 +1,4 @@
+Task/Scheduler:
+    ☐ handle exceptions
+    ☐ add awaiters for WIN32 events
+    ☐ integrate the windows message loop into the scheduler
