@@ -53,7 +53,7 @@ namespace tasky
 		}
 
 		template<typename T, typename Allocator>
-		void schedule(std::vector<Task<T, Allocator>> tasks)
+		void schedule(const std::vector<Task<T, Allocator>>& tasks)
 		{
 			running_tasks.fetch_add(tasks.size(), std::memory_order::acq_rel);
 			for (auto& t : tasks)
@@ -74,13 +74,13 @@ namespace tasky
 		}
 
 		template<typename T, typename Allocator>
-		void schedule(Task<T, Allocator> task)
+		void schedule(const Task<T, Allocator>& task)
 		{
 			schedule(task.handle);
 		}
 
 		template<typename T, typename Allocator, typename... Ts>
-		void schedule(Task<T, Allocator> task, Ts... tasks)
+		void schedule(const Task<T, Allocator>& task, Ts... tasks)
 		{
 			schedule(task.handle);
 			schedule(std::forward<Ts>(tasks)...);
@@ -132,6 +132,10 @@ namespace tasky
 						if (i == 0)
 							schedule_awaiting(awaiting);
 					}
+					else if (handle.promise().exception)
+					{
+						std::rethrow_exception(handle.promise().exception);
+					}
 					else
 					{
 						handle.destroy();
@@ -144,7 +148,7 @@ namespace tasky
 			}
 		}
 
-		std::coroutine_handle<PromiseBase> next_task()
+		[[nodiscard]] std::coroutine_handle<PromiseBase> next_task()
 		{
 			if (queue_.size() == 0)
 				return nullptr;
@@ -171,7 +175,7 @@ namespace tasky
 	public:
 		struct promise_type : public PromiseBase
 		{
-			static void* operator new(std::size_t size)
+			[[nodiscard]] static void* operator new(std::size_t size)
 			{
 				return Allocator::alloc(size);
 			}
@@ -209,7 +213,7 @@ namespace tasky
 		Task(Task&& task) = delete;
 		~Task() {}
 
-		auto operator co_await()
+		[[nodiscard]] auto operator co_await() const noexcept
 		{
 			struct Awaiter
 			{
@@ -235,7 +239,7 @@ namespace tasky
 
 				std::coroutine_handle<promise_type> coro;
 
-				Awaiter(std::coroutine_handle<promise_type> coro) : coro(coro) {}
+				Awaiter(std::coroutine_handle<promise_type> coro) noexcept : coro(coro) {}
 				~Awaiter() { coro.destroy(); }
 			};
 
@@ -263,7 +267,7 @@ namespace tasky
 
 			virtual ~promise_type() {}
 
-			Task<void> get_return_object() noexcept { return Task<void>(std::coroutine_handle<promise_type>::from_promise(*this)); }
+			[[nodiscard]] Task<void> get_return_object() noexcept { return Task<void>(std::coroutine_handle<promise_type>::from_promise(*this)); }
 
 			constexpr void return_void() const
 			{
@@ -279,7 +283,7 @@ namespace tasky
 		Task(Task&& task) = delete;
 		~Task() {}
 
-		auto operator co_await()
+		[[nodiscard]] auto operator co_await() noexcept
 		{
 			struct Awaiter
 			{
@@ -303,7 +307,7 @@ namespace tasky
 
 				std::coroutine_handle<promise_type> coro;
 
-				Awaiter(std::coroutine_handle<promise_type> coro) : coro(coro) {}
+				Awaiter(std::coroutine_handle<promise_type> coro) noexcept : coro(coro) {}
 				~Awaiter() { coro.destroy(); }
 			};
 
@@ -314,110 +318,136 @@ namespace tasky
 	};
 
 	template<typename T, typename Allocator = DefaultAllocator>
+	struct MultipleAwaiter
+	{
+		constexpr bool await_ready() const noexcept { return false; }
+
+		[[nodiscard]] constexpr std::vector<T> await_resume() const
+		{
+			std::vector<T> results;
+			for (auto& coro : coros)
+			{
+				using P = Task<T, Allocator>::promise_type;
+				auto x = std::coroutine_handle<P>::from_address(coro.address());
+				auto& p = x.promise();
+
+				if (p.exception)
+					std::rethrow_exception(p.exception);
+
+				results.emplace_back(p.value.value());
+			}
+			return results;
+		}
+
+		void await_suspend(std::coroutine_handle<> awaiting_handle)
+		{
+			auto handle = PromiseBase::cast(awaiting_handle);
+
+			auto& promise = handle.promise();
+			Scheduler* scheduler = promise.scheduler;
+			promise.awaiting_count.store(coros.size(), std::memory_order::release);
+
+			for (auto& coro : coros)
+			{
+				coro.promise().awaiting_coro = handle;
+				scheduler->schedule(coro);
+			}
+		}
+
+		MultipleAwaiter(std::initializer_list<Task<T, Allocator>> tasks) : coros()
+		{
+			for (auto& coro : tasks)
+				coros.emplace_back(PromiseBase::cast(coro.handle));
+		}
+
+		MultipleAwaiter(std::vector<Task<T, Allocator>>&& tasks) : coros()
+		{
+			for (auto& coro : tasks)
+				coros.emplace_back(PromiseBase::cast(coro.handle));
+		}
+
+		~MultipleAwaiter()
+		{
+			for (auto& coro : coros)
+				coro.destroy();
+		}
+
+		std::vector<std::coroutine_handle<PromiseBase>> coros;
+	};
+
+	template<typename Allocator>
+	struct MultipleAwaiter<void, Allocator>
+	{
+		[[nodiscard]] constexpr bool await_ready() const noexcept { return false; }
+
+		constexpr void await_resume() const
+		{
+			for (auto& coro : coros)
+			{
+				auto& promise = PromiseBase::cast(coro).promise();
+
+				if (promise.exception)
+					std::rethrow_exception(promise.exception);
+			}
+		}
+
+		void await_suspend(std::coroutine_handle<> awaiting_handle)
+		{
+			auto handle = PromiseBase::cast(awaiting_handle);
+
+			auto& promise = handle.promise();
+			Scheduler* scheduler = promise.scheduler;
+			promise.awaiting_count.store(coros.size(), std::memory_order::release);
+
+			for (auto& coro : coros)
+			{
+				coro.promise().awaiting_coro = handle;
+				scheduler->schedule(coro);
+			}
+		}
+
+		MultipleAwaiter(std::initializer_list<Task<void, Allocator>> tasks) : coros()
+		{
+			for (auto& coro : tasks)
+				coros.emplace_back(PromiseBase::cast(coro.handle));
+		}
+
+		MultipleAwaiter(std::vector<Task<void, Allocator>>&& tasks) : coros()
+		{
+			for (auto& coro : tasks)
+				coros.emplace_back(PromiseBase::cast(coro.handle));
+		}
+
+		~MultipleAwaiter()
+		{
+			for (auto& coro : coros)
+				coro.destroy();
+		}
+
+		std::vector<std::coroutine_handle<PromiseBase>> coros;
+	};
+
+	template<typename T, typename Allocator = DefaultAllocator>
 	auto all(std::initializer_list<Task<T, Allocator>> elements)
 	{
-		struct Awaiter
-		{
-			constexpr bool await_ready() const noexcept { return false; }
-
-			constexpr std::vector<T> await_resume() const
-			{
-				std::vector<T> results;
-				for (auto& coro : coros)
-				{
-					using P = Task<T, Allocator>::promise_type;
-					auto x = std::coroutine_handle<P>::from_address(coro.address());
-					auto& p = x.promise();
-
-					if (p.exception)
-						std::rethrow_exception(p.exception);
-
-					results.emplace_back(p.value.value());
-				}
-				return results;
-			}
-
-			void await_suspend(std::coroutine_handle<> awaiting_handle)
-			{
-				auto handle = PromiseBase::cast(awaiting_handle);
-
-				auto& promise = handle.promise();
-				Scheduler* scheduler = promise.scheduler;
-				promise.awaiting_count.store(coros.size(), std::memory_order::release);
-
-				for (auto& coro : coros)
-				{
-					coro.promise().awaiting_coro = handle;
-					scheduler->schedule(coro);
-				}
-			}
-
-			Awaiter(std::initializer_list<Task<T, Allocator>> tasks) : coros()
-			{
-				for (auto& coro : tasks)
-					coros.emplace_back(PromiseBase::cast(coro.handle));
-			}
-
-			~Awaiter()
-			{
-				for (auto& coro : coros)
-					coro.destroy();
-			}
-
-			std::vector<std::coroutine_handle<PromiseBase>> coros;
-		};
-
-		return Awaiter(std::move(elements));
+		return MultipleAwaiter<T, Allocator>(std::move(elements));
 	};
 
 	template<typename Allocator = DefaultAllocator>
 	auto all(std::initializer_list<Task<void, Allocator>> elements)
 	{
-		struct Awaiter
-		{
-			constexpr bool await_ready() const noexcept { return false; }
+		return MultipleAwaiter<void, Allocator>(std::move(elements));
+	};
 
-			constexpr void await_resume() const
-			{
-				for (auto& coro : coros)
-				{
-					auto& promise = PromiseBase::cast(coro).promise();
+	template<typename T, typename Allocator = DefaultAllocator>
+	auto all(std::vector<Task<T, Allocator>>&& elements)
+	{
+		return MultipleAwaiter<T, Allocator>(std::move(elements));
+	};
 
-					if (promise.exception)
-						std::rethrow_exception(promise.exception);
-				}
-			}
-
-			void await_suspend(std::coroutine_handle<> awaiting_handle)
-			{
-				auto handle = PromiseBase::cast(awaiting_handle);
-
-				auto& promise = handle.promise();
-				Scheduler* scheduler = promise.scheduler;
-				promise.awaiting_count.store(coros.size(), std::memory_order::release);
-
-				for (auto& coro : coros)
-				{
-					coro.promise().awaiting_coro = handle;
-					scheduler->schedule(coro);
-				}
-			}
-
-			Awaiter(std::initializer_list<Task<void, Allocator>> tasks) : coros()
-			{
-				for (auto& coro : tasks)
-					coros.emplace_back(PromiseBase::cast(coro.handle));
-			}
-
-			~Awaiter()
-			{
-				for (auto& coro : coros)
-					coro.destroy();
-			}
-
-			std::vector<std::coroutine_handle<PromiseBase>> coros;
-		};
-
-		return Awaiter(std::move(elements));
+	template<typename Allocator = DefaultAllocator>
+	auto all(std::vector<Task<void, Allocator>>&& elements)
+	{
+		return MultipleAwaiter<void, Allocator>(std::move(elements));
 	};
 }
