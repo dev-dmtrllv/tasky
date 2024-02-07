@@ -1,271 +1,206 @@
 #include "pch.hpp"
 
-#define LOG(...) std::println(__VA_ARGS__)
-#define DBG(...) // std::println(__VA_ARGS__)
-
-class Scheduler;
-class TaskBasePromise;
-
-using BaseHandle = std::coroutine_handle<TaskBasePromise>;
-
 template<typename T>
 class Task;
+
+template<>
+class Task<void>;
+
+class Scheduler;
+
+struct PromiseBase
+{
+	template<typename T>
+	static std::coroutine_handle<PromiseBase> cast(std::coroutine_handle<T> handle) noexcept { return std::coroutine_handle<PromiseBase>::from_address(handle.address()); }
+
+	constexpr std::suspend_always initial_suspend() const noexcept { return {}; }
+	constexpr std::suspend_always final_suspend() const noexcept { return {}; }
+
+	void unhandled_exception()
+	{
+		exception = std::current_exception();
+	}
+	
+	virtual ~PromiseBase() = 0 {}
+
+	std::coroutine_handle<PromiseBase> awaiting_coro;
+	std::exception_ptr exception = nullptr;
+	Scheduler* scheduler;
+};
 
 class Scheduler
 {
 public:
-	Scheduler() {}
-	~Scheduler() {}
+	template<typename T>
+	void schedule(std::coroutine_handle<T> handle)
+	{
+		std::coroutine_handle<PromiseBase> h = PromiseBase::cast(handle);
+		h.promise().scheduler = this;
+		queue_.push(h);
+	}
 
 	template<typename T>
-	void schedule(Task<T>&& task)
+	void schedule(Task<T> task)
 	{
-		schedule(task.handle.address());
+		schedule(task.handle);
 	}
 
 	template<typename T, typename... Ts>
-	void schedule(Task<T>&& task, Ts&&... ts)
+	void schedule(Task<T> task, Ts... tasks)
 	{
-		schedule(std::move(task));
-		schedule(std::forward<Ts>(ts)...);
+		schedule(task.handle);
+		schedule(std::forward<Ts>(tasks)...);
 	}
 
-	void run();
+	void run()
+	{
+		while (queue_.size() > 0)
+		{
+			auto handle = queue_.front();
+			queue_.pop();
 
-	void schedule(void* taskPtr);
-	void scheduleAwaiting(void* taskPtr);
+			if (!handle.done())
+			{
+				handle.resume();
+				if (handle.done())
+				{
+					auto awaiting = handle.promise().awaiting_coro;
+					if (awaiting != nullptr)
+						queue_.push(handle.promise().awaiting_coro);
+				}
+			}
+		}
+	}
 
-	std::queue<void*> tasks;
-	std::atomic<std::size_t> tasksInFlight = 0;
+private:
+	std::queue<std::coroutine_handle<PromiseBase>> queue_;
 };
 
-class TaskBasePromise
-{
-public:
-	static void* operator new(std::size_t bytes)
-	{
-		DBG("alloc");
-		return malloc(bytes);
-	}
 
-	static void operator delete(void* ptr)
-	{
-		DBG("free");
-		free(ptr);
-	}
 
-	template<typename T>
-	static BaseHandle castHandle(std::coroutine_handle<T> handle)
-	{
-		return BaseHandle::from_address(handle.address());
-	}
-
-	static TaskBasePromise& from(void* ptr)
-	{
-		return BaseHandle::from_address(ptr).promise();
-	}
-
-	virtual ~TaskBasePromise()
-	{
-		DBG("~TaskBasePromise");
-		assert(scheduler);
-		scheduler->tasksInFlight.fetch_sub(1, std::memory_order::acq_rel);
-	}
-
-	std::suspend_always initial_suspend() noexcept
-	{
-		DBG("initial_suspend()");
-		return {};
-	}
-
-	std::suspend_always final_suspend() noexcept
-	{
-		DBG("final_suspend()");
-		return {};
-	}
-
-	void unhandled_exception()
-	{
-		DBG("return_value()");
-		exception.emplace(std::current_exception());
-	}
-
-	std::optional<std::exception_ptr> exception = {};
-	Scheduler* scheduler = nullptr;
-	BaseHandle awaitingHandle = nullptr;
-};
-
-class TaskBase
-{
-public:
-	using promise_type = TaskBasePromise;
-
-	template<typename T>
-	TaskBase(std::coroutine_handle<T> handle) : handle(BaseHandle::from_address(handle.address())) {}
-	virtual ~TaskBase() { DBG("~TaskBase()"); }
-
-	template<typename T>
-	inline T& promise() const noexcept { return std::coroutine_handle<T>::from_address(handle.address()).promise(); }
-
-	bool await_ready()
-	{
-		DBG("await_ready() -> false");
-		return false;
-	}
-
-	template<typename T>
-	void await_suspend([[maybe_unused]] std::coroutine_handle<T> parentHandle)
-	{
-		DBG("await_suspend()");
-		auto& p = handle.promise();
-		p.awaitingHandle = TaskBasePromise::castHandle(parentHandle);
-		p.scheduler = p.awaitingHandle.promise().scheduler;
-		p.scheduler->schedule(this->handle.address());
-	}
-
-	BaseHandle handle;
-};
 
 template<typename T>
-class Task : public TaskBase
+class Task
 {
 public:
-	class promise_type : public TaskBasePromise
+	struct promise_type : public PromiseBase
 	{
-	public:
 		virtual ~promise_type() {}
 
-		Task<T> get_return_object()
-		{
-			DBG("get_return_object()");
-			return Task(std::coroutine_handle<promise_type>::from_promise(*this));
-		}
+		constexpr Task<T> get_return_object() noexcept { return Task<T>(std::coroutine_handle<promise_type>::from_promise(*this)); }
 
-		void return_value(T val)
-		{
-			DBG("return_value()");
-			this->value.emplace(val);
-		}
+		constexpr void return_value(const T& val) noexcept { value.emplace(std::move(val)); }
+		constexpr void return_value(T&& val) noexcept { value.emplace(val); }
 
-		std::optional<T> value = {};
+		std::optional<T> value;
 	};
 
-	Task(std::coroutine_handle<promise_type> handle) : TaskBase(handle) {}
-	virtual ~Task() {}
+	using Handle = std::coroutine_handle<promise_type>;
 
-	T await_resume()
+	Task(Handle handle) : handle(handle) {}
+	~Task() {}
+
+	auto operator co_await()
 	{
-		DBG("await_resume()");
-		return promise<promise_type>().value.value();
+		struct Awaiter
+		{
+			constexpr bool await_ready() const noexcept { return false; }
+
+			constexpr T await_resume() const noexcept
+			{
+				return coro.promise().value.value();
+			}
+
+			void await_suspend(std::coroutine_handle<> handle)
+			{
+				auto a = PromiseBase::cast(handle);
+				coro.promise().awaiting_coro = a;
+				a.promise().scheduler->schedule(coro);
+			}
+
+			std::coroutine_handle<promise_type> coro;
+
+			Awaiter(std::coroutine_handle<promise_type> coro) : coro(coro) {}
+		};
+
+		return Awaiter(handle);
 	}
+
+	Handle handle;
 };
 
 
 template<>
-class Task<void> : public TaskBase
+class Task<void>
 {
 public:
-	class promise_type : public TaskBasePromise
+	struct promise_type : public PromiseBase
 	{
-	public:
 		virtual ~promise_type() {}
 
-		Task<void> get_return_object()
-		{
-			DBG("get_return_object()");
-			return Task(std::coroutine_handle<promise_type>::from_promise(*this));
-		}
+		Task<void> get_return_object() noexcept { return Task<void>(std::coroutine_handle<promise_type>::from_promise(*this)); }
 
-		void return_void()
-		{
-			DBG("return_value()");
-			didReturn = true;
-		}
-
-		bool didReturn = false;
+		constexpr void return_void() const noexcept {}
 	};
 
-	Task(std::coroutine_handle<promise_type> handle) : TaskBase(handle) {}
-	virtual ~Task() {}
+	using Handle = std::coroutine_handle<promise_type>;
 
-	void await_resume()
+	Task(Handle handle) : handle(handle) {}
+	~Task() {}
+
+	auto operator co_await()
 	{
-		DBG("await_resume()");
+		struct Awaiter
+		{
+			constexpr bool await_ready() const noexcept { return false; }
+			constexpr void await_resume() const noexcept {}
+
+			void await_suspend(std::coroutine_handle<> handle)
+			{
+				auto a = PromiseBase::cast(handle);
+				coro.promise().awaiting_coro = a;
+				a.promise().scheduler->schedule(coro);
+			}
+
+			std::coroutine_handle<promise_type> coro;
+
+			Awaiter(std::coroutine_handle<promise_type> coro) : coro(coro) {}
+		};
+
+		return Awaiter(handle);
 	}
+
+	Handle handle;
 };
 
-Task<int> test2(int a, int b)
+Task<int> add(int a, int b)
 {
-	LOG("test2({}, {}) -> {}", a, b, a + b);
+	std::cout << "add " << a << " + " << b << std::endl;
 	co_return a + b;
 }
 
-Task<void> test(int count)
+Task<int> test_loop(int loops)
 {
-	int a = 0;
+	int x = 0;
 
-	LOG("test({})", count);
+	for (int i = 0; i < loops; i++)
+		x += co_await add(x, i);
 
-	for (int i = 0; i < count; i++)
-		a = co_await test2(a, i);
+	co_return x;
+}
 
-	LOG("test result: {}", a);
+Task<void> test(int loops = 1)
+{
+	std::cout << co_await test_loop(loops) << std::endl;
 }
 
 int main([[maybe_unused]] int argc, [[maybe_unused]] char* argv[])
 {
-	int c = argc == 2 ? atoi(argv[1]) : 1;
-
 	Scheduler s;
 
-	s.schedule(test(c), test(c));
+	s.schedule(test(10), test(10), test(20));
 
 	s.run();
 
 	return 0;
-}
-
-void Scheduler::run()
-{
-	while (tasksInFlight.load(std::memory_order::acquire) > 0)
-	{
-		DBG("-------- RUN NEXT --------");
-		auto task = BaseHandle::from_address(tasks.front());
-		tasks.pop();
-
-		if (task.done())
-		{
-			DBG("Task already done!");
-		}
-		else
-		{
-			task.resume();
-			if (task.done())
-			{
-				if (task.promise().awaitingHandle != nullptr)
-					scheduleAwaiting(task.promise().awaitingHandle.address());
-
-				task.destroy();
-			}
-			else
-			{
-				DBG("Awaiting...");
-			}
-		}
-	}
-}
-
-void Scheduler::schedule(void* taskPtr)
-{
-	DBG("schedule");
-	tasksInFlight.fetch_add(1, std::memory_order::acq_rel);
-	BaseHandle::from_address(taskPtr).promise().scheduler = this;
-	tasks.push(taskPtr);
-}
-
-void Scheduler::scheduleAwaiting(void* taskPtr)
-{
-	DBG("schedule awaiting");
-	BaseHandle::from_address(taskPtr).promise().scheduler = this;
-	tasks.push(taskPtr);
 }
