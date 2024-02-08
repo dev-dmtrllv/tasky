@@ -3,6 +3,10 @@
 #include "pch.hpp"
 #include "lockfree/queue.hpp"
 
+#ifdef _WIN32
+#include <Windows.h>
+#endif
+
 namespace tasky
 {
 	struct DefaultAllocator
@@ -22,7 +26,7 @@ namespace tasky
 	struct PromiseBase
 	{
 		template<typename T>
-		static std::coroutine_handle<PromiseBase> cast(std::coroutine_handle<T> handle) noexcept { return std::coroutine_handle<PromiseBase>::from_address(handle.address()); }
+		constexpr static std::coroutine_handle<PromiseBase> cast(std::coroutine_handle<T> handle) noexcept { return std::coroutine_handle<PromiseBase>::from_address(handle.address()); }
 
 		constexpr std::suspend_always initial_suspend() const noexcept { return {}; }
 		constexpr std::suspend_always final_suspend() const noexcept { return {}; }
@@ -100,6 +104,11 @@ namespace tasky
 			workers_.clear();
 		}
 
+		void schedule_awaiting(std::coroutine_handle<PromiseBase> handle)
+		{
+			queue_.push(handle);
+		}
+
 	private:
 		void release_task() { running_tasks.fetch_sub(1, std::memory_order::acq_rel); }
 
@@ -158,11 +167,6 @@ namespace tasky
 			return handle;
 		}
 
-		void schedule_awaiting(std::coroutine_handle<PromiseBase> handle)
-		{
-			queue_.push(handle);
-		}
-
 		std::atomic<std::size_t> running_tasks = 0;
 		const std::size_t max_workers;
 		lockfree::Queue<std::coroutine_handle<PromiseBase>> queue_;
@@ -187,7 +191,7 @@ namespace tasky
 
 			virtual ~promise_type() {}
 
-			constexpr Task<T> get_return_object() noexcept { return Task<T>(std::coroutine_handle<promise_type>::from_promise(*this)); }
+			[[nodiscard]] constexpr Task<T> get_return_object() noexcept { return Task<T>(std::coroutine_handle<promise_type>::from_promise(*this)); }
 
 			constexpr void return_value(const T& val) noexcept
 			{
@@ -219,7 +223,7 @@ namespace tasky
 			{
 				constexpr bool await_ready() const noexcept { return false; }
 
-				constexpr T await_resume() const
+				[[nodiscard]] constexpr T await_resume() const
 				{
 					if (coro.promise().exception)
 						std::rethrow_exception(coro.promise().exception);
@@ -255,7 +259,7 @@ namespace tasky
 	public:
 		struct promise_type : public PromiseBase
 		{
-			static void* operator new(std::size_t size)
+			[[nodiscard]] static void* operator new(std::size_t size)
 			{
 				return Allocator::alloc(size);
 			}
@@ -428,26 +432,182 @@ namespace tasky
 	};
 
 	template<typename T, typename Allocator = DefaultAllocator>
-	auto all(std::initializer_list<Task<T, Allocator>> elements)
+	[[nodiscard]] auto all(std::initializer_list<Task<T, Allocator>> elements)
 	{
 		return MultipleAwaiter<T, Allocator>(std::move(elements));
 	};
 
 	template<typename Allocator = DefaultAllocator>
-	auto all(std::initializer_list<Task<void, Allocator>> elements)
+	[[nodiscard]] auto all(std::initializer_list<Task<void, Allocator>> elements)
 	{
 		return MultipleAwaiter<void, Allocator>(std::move(elements));
 	};
 
 	template<typename T, typename Allocator = DefaultAllocator>
-	auto all(std::vector<Task<T, Allocator>>&& elements)
+	[[nodiscard]] auto all(std::vector<Task<T, Allocator>>&& elements)
 	{
 		return MultipleAwaiter<T, Allocator>(std::move(elements));
 	};
 
 	template<typename Allocator = DefaultAllocator>
-	auto all(std::vector<Task<void, Allocator>>&& elements)
+	[[nodiscard]] auto all(std::vector<Task<void, Allocator>>&& elements)
 	{
 		return MultipleAwaiter<void, Allocator>(std::move(elements));
 	};
+
+#ifdef _WIN32
+	void WINAPI onFileRead(
+		_In_    DWORD dwErrorCode,
+		_In_    DWORD dwNumberOfBytesTransfered,
+		_Inout_ LPOVERLAPPED lpOverlapped
+	);
+
+	struct ReadFileAwaiter : public OVERLAPPED
+	{
+		ReadFileAwaiter(const std::string& path) : OVERLAPPED(),
+			data_()
+		{
+			fileHandle_ = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
+
+			if (fileHandle_ == INVALID_HANDLE_VALUE)
+				throw std::runtime_error("Could not create file handle!");
+		}
+
+		bool await_ready() const noexcept
+		{
+			return false;
+		}
+
+		std::string await_resume() const
+		{
+			return std::move(data_);
+		}
+
+		void await_suspend(std::coroutine_handle<> handle)
+		{
+			handle_ = tasky::PromiseBase::cast(handle);
+
+			[[maybe_unused]] DWORD fileSizeHigh = 0;
+			DWORD fileSizeLow = GetFileSize(fileHandle_, &fileSizeHigh);
+
+			data_.resize(fileSizeLow);
+
+			if (!BindIoCompletionCallback(fileHandle_, onFileRead, 0))
+				throw std::runtime_error("Could not bind IO completion callback!");
+
+			if (!ReadFile(fileHandle_, data_.data(), fileSizeLow, &read_, this))
+			{
+				const int err = GetLastError();
+				if (err != 997)
+					throw std::runtime_error("Could not read file!");
+
+			}
+		}
+
+	private:
+		DWORD read_ = 0;
+		std::string data_;
+		void* fileHandle_ = nullptr;
+		std::coroutine_handle<tasky::PromiseBase> handle_ = nullptr;
+
+		friend void WINAPI onFileRead(
+			_In_    DWORD dwErrorCode,
+			_In_    DWORD dwNumberOfBytesTransfered,
+			_Inout_ LPOVERLAPPED lpOverlapped
+		);
+	};
+
+	void WINAPI onFileRead(
+		_In_    DWORD dwErrorCode,
+		_In_    DWORD dwNumberOfBytesTransfered,
+		_Inout_ LPOVERLAPPED lpOverlapped
+	)
+	{
+		auto* s = static_cast<ReadFileAwaiter*>(lpOverlapped);
+
+		if (!CloseHandle(s->fileHandle_))
+			throw std::runtime_error("Could not close file handle!");
+
+		s->handle_.promise().scheduler->schedule_awaiting(s->handle_);
+	}
+
+	void WINAPI onFileWrite(
+		_In_    DWORD dwErrorCode,
+		_In_    DWORD dwNumberOfBytesTransfered,
+		_Inout_ LPOVERLAPPED lpOverlapped
+	);
+
+	struct WriteFileAwaiter : public OVERLAPPED
+	{
+		WriteFileAwaiter(const std::string& path, const std::string& data) : OVERLAPPED(),
+			data_(data)
+		{
+			fileHandle_ = CreateFileA(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
+
+			if (fileHandle_ == INVALID_HANDLE_VALUE)
+				throw std::runtime_error("Could not create file handle!");
+		}
+
+		bool await_ready() const noexcept
+		{
+			return false;
+		}
+
+		void await_resume() const {}
+
+		void await_suspend(std::coroutine_handle<> handle)
+		{
+			handle_ = tasky::PromiseBase::cast(handle);
+
+			if (!BindIoCompletionCallback(fileHandle_, onFileWrite, 0))
+				throw std::runtime_error("Could not bind IO completion callback!");
+
+			DWORD s = static_cast<DWORD>(data_.size());
+
+			if (!WriteFile(fileHandle_, data_.data(), s, &written_, this))
+			{
+				const int err = GetLastError();
+				if (err != 997)
+					throw std::runtime_error("Could not write file!");
+			}
+		}
+
+	private:
+		DWORD written_ = 0;
+		const std::string& data_;
+		void* fileHandle_ = nullptr;
+		std::coroutine_handle<tasky::PromiseBase> handle_ = nullptr;
+
+		friend void WINAPI onFileWrite(
+			_In_    DWORD dwErrorCode,
+			_In_    DWORD dwNumberOfBytesTransfered,
+			_Inout_ LPOVERLAPPED lpOverlapped
+		);
+	};
+
+	void WINAPI onFileWrite(
+		_In_    DWORD dwErrorCode,
+		_In_    DWORD dwNumberOfBytesTransfered,
+		_Inout_ LPOVERLAPPED lpOverlapped
+	)
+	{
+		auto* s = static_cast<WriteFileAwaiter*>(lpOverlapped);
+
+		if (!CloseHandle(s->fileHandle_))
+			throw std::runtime_error("Could not close file handle!");
+
+		s->handle_.promise().scheduler->schedule_awaiting(s->handle_);
+	}
+
+#endif
+
+	Task<std::string> readFile(const std::string& path)
+	{
+		co_return co_await ReadFileAwaiter(path);
+	}
+
+	Task<void> writeFile(const std::string& path, const std::string& data)
+	{
+		co_await WriteFileAwaiter(path, data);
+	}
 }

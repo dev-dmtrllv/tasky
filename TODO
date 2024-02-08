@@ -1,7 +1,5 @@
 Task/Scheduler:
     ☐ handle exceptions (propagate to the run method of the scheduler)
-    ☐ add awaiters for WIN32 events
-    ☐ integrate the windows message loop into the scheduler
     ☐ check constexpr/noexcept/const for all functions
     ☐ add a custom allocator to prevent calling malloc/free every time
     ☐ add `[[nodiscard]]` where needed
